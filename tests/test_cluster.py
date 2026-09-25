@@ -4,6 +4,7 @@ import select
 import socket
 import socketserver
 import threading
+from contextlib import contextmanager
 from typing import List
 import warnings
 from queue import LifoQueue, Queue
@@ -4530,6 +4531,121 @@ class TestNodesManager:
             nodes_cache_names = list(nodes_manager.nodes_cache.keys())
             assert startup_node_names == [node1.name]
             assert nodes_cache_names == [node1.name]
+
+
+@pytest.mark.fixed_client
+class TestClusterConnectionErrorHandling:
+    """Tests for cluster connection error handling behavior."""
+
+    @contextmanager
+    def _mocked_cluster_client(self, execute_command_mock):
+        """
+        Build a RedisCluster whose topology discovery is fully mocked:
+        CLUSTER SLOTS/CONFIG/INFO go through the patched Redis.execute_command
+        and the commands parser is initialized with a static command set.
+        """
+        with patch.object(Redis, "execute_command") as execute_command:
+            execute_command.side_effect = execute_command_mock
+            with patch.object(
+                CommandsParser, "initialize", autospec=True
+            ) as cmd_parser_initialize:
+
+                def cmd_init_mock(self, r):
+                    self.commands = {
+                        "get": {
+                            "name": "get",
+                            "arity": 2,
+                            "flags": ["readonly", "fast"],
+                            "first_key_pos": 1,
+                            "last_key_pos": 1,
+                            "step_count": 1,
+                        }
+                    }
+
+                cmd_parser_initialize.side_effect = cmd_init_mock
+
+                with patch.multiple(
+                    Connection, send_command=DEFAULT, connect=DEFAULT, can_read=DEFAULT
+                ) as connection_mocks:
+                    connection_mocks["can_read"].return_value = False
+                    yield
+
+    @staticmethod
+    def _topology_commands_mock(*args, **kwargs):
+        if args[0] == "CLUSTER SLOTS":
+            return default_cluster_slots
+        elif args[0] == "COMMAND":
+            return {"get": [], "set": []}
+        elif args[0] == "INFO":
+            return {"cluster_enabled": True}
+        elif len(args) > 1 and args[1] == "cluster-require-full-coverage":
+            return {"cluster-require-full-coverage": "yes"}
+        return None
+
+    def test_connection_error_calls_move_node_to_end_of_cached_nodes(self):
+        """
+        Test that ConnectionError triggers move_node_to_end_of_cached_nodes
+        and a reinitialization that defers the failed node.
+        """
+        with self._mocked_cluster_client(self._topology_commands_mock):
+            with patch.object(
+                NodesManager, "move_node_to_end_of_cached_nodes", autospec=True
+            ) as move_node_to_end_of_cached_nodes:
+                with patch.object(Redis, "parse_response") as parse_response:
+                    parse_response.side_effect = ConnectionError("Connection failed")
+
+                    rc = RedisCluster(host=default_host, port=7000)
+                    initialize_calls = []
+                    original_initialize = NodesManager.initialize
+
+                    def initialize(nodes_manager, *args, **kwargs):
+                        if nodes_manager is rc.nodes_manager:
+                            initialize_calls.append(kwargs)
+                        return original_initialize(nodes_manager, *args, **kwargs)
+
+                    with patch.object(
+                        NodesManager,
+                        "initialize",
+                        autospec=True,
+                        side_effect=initialize,
+                    ):
+                        with pytest.raises(ConnectionError):
+                            rc.get("foo")
+
+                    # Verify move_node_to_end_of_cached_nodes was called
+                    move_node_to_end_of_cached_nodes.assert_called()
+                    assert any(
+                        call.get("last_failed_node_name") is not None
+                        for call in initialize_calls
+                    )
+
+    def test_connection_error_handles_node_connections(self):
+        """
+        Test that ConnectionError marks in-use connections for reconnect and
+        disconnects the idle ones instead of dropping the whole pool.
+        """
+        with self._mocked_cluster_client(self._topology_commands_mock):
+            with patch.object(
+                ConnectionPool,
+                "update_active_connections_for_reconnect",
+                autospec=True,
+            ) as update_active:
+                with patch.object(
+                    ConnectionPool,
+                    "disconnect_free_connections",
+                    autospec=True,
+                ) as disconnect_free:
+                    with patch.object(Redis, "parse_response") as parse_response:
+                        parse_response.side_effect = ConnectionError(
+                            "Connection failed"
+                        )
+
+                        rc = RedisCluster(host=default_host, port=7000)
+                        with pytest.raises(ConnectionError):
+                            rc.get("foo")
+
+                        update_active.assert_called()
+                        disconnect_free.assert_called()
 
 
 @pytest.mark.fixed_client

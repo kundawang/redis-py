@@ -1345,6 +1345,77 @@ class TestUnitConnectionPool:
         assert client.connection_pool.cache.config.is_allowed_to_cache("GET") is False
         client.close()
 
+    def test_update_active_connections_for_reconnect_marks_in_use_only(self):
+        """
+        update_active_connections_for_reconnect marks in-use connections for
+        reconnect and leaves idle connections untouched, so in-flight commands
+        can complete before their connection is recycled.
+        """
+        pool = ConnectionPool(max_connections=10)
+
+        in_use_conn = MagicMock()
+        in_use_conn.pid = pool.pid
+        idle_conn = MagicMock()
+        idle_conn.pid = pool.pid
+
+        pool._in_use_connections.add(in_use_conn)
+        pool._available_connections.append(idle_conn)
+
+        pool.update_active_connections_for_reconnect()
+
+        in_use_conn.mark_for_reconnect.assert_called_once()
+        idle_conn.mark_for_reconnect.assert_not_called()
+
+        pool.disconnect()
+
+    def test_disconnect_free_connections_disconnects_idle_only(self):
+        """
+        disconnect_free_connections disconnects idle connections only; in-use
+        connections are left connected so in-flight commands are not broken.
+        """
+        pool = ConnectionPool(max_connections=10)
+
+        idle_conn1 = MagicMock()
+        idle_conn1.pid = pool.pid
+        idle_conn2 = MagicMock()
+        idle_conn2.pid = pool.pid
+        in_use_conn = MagicMock()
+        in_use_conn.pid = pool.pid
+
+        pool._available_connections.append(idle_conn1)
+        pool._available_connections.append(idle_conn2)
+        pool._in_use_connections.add(in_use_conn)
+
+        pool.disconnect_free_connections()
+
+        idle_conn1.disconnect.assert_called_once()
+        idle_conn2.disconnect.assert_called_once()
+        in_use_conn.disconnect.assert_not_called()
+
+        # Idle connections stay in the pool and reconnect on next use
+        assert idle_conn1 in pool._available_connections
+        assert idle_conn2 in pool._available_connections
+
+        pool.disconnect()
+
+    def test_disconnect_free_connections_with_no_idle_connections(self):
+        """
+        disconnect_free_connections is a no-op when the pool has no idle
+        connections.
+        """
+        pool = ConnectionPool(max_connections=10)
+
+        in_use_conn = MagicMock()
+        in_use_conn.pid = pool.pid
+        pool._in_use_connections.add(in_use_conn)
+
+        # Should not raise
+        pool.disconnect_free_connections()
+
+        in_use_conn.disconnect.assert_not_called()
+
+        pool.disconnect()
+
 
 @pytest.mark.fixed_client
 class TestUnitCacheProxyConnection:
