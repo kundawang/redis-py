@@ -2738,6 +2738,90 @@ class TestPubSubBlockingListen:
         thread.join(timeout=1.0)
         p.close()
 
+    def test_blocking_listen_does_not_mutate_socket_timeout(self, request):
+        """
+        A blocking read must not mutate the connection's configured
+        socket_timeout. Otherwise reconnect/AUTH/HELLO/resubscribe paths
+        triggered by retries inside _execute would inherit no timeout and
+        could hang indefinitely. The blocking read uses a per-read timeout
+        override rather than clearing socket_timeout for the call's
+        duration, and the socket's own timeout is restored afterwards.
+        """
+        r = self._make_client(
+            request, socket_timeout=self.SOCKET_TIMEOUT, no_retry=True
+        )
+        publisher = self._make_client(request)
+        p = r.pubsub()
+        p.subscribe("foo")
+        wait_for_message(p, timeout=1.0)
+
+        conn = p.connection
+        orig_timeout = conn.socket_timeout
+        assert orig_timeout == self.SOCKET_TIMEOUT
+
+        # Sample socket_timeout while the blocking read is in flight, to
+        # catch any mutation that happens only for the duration of the call.
+        samples = []
+        stop_sampling = threading.Event()
+
+        def sample_timeout_during_read():
+            while not stop_sampling.is_set():
+                samples.append(conn.socket_timeout)
+                time.sleep(0.01)
+
+        def publish_after_delay():
+            time.sleep(self.PUBLISH_DELAY)
+            publisher.publish("foo", "msg")
+
+        sampler = threading.Thread(target=sample_timeout_during_read, daemon=True)
+        publisher_thread = threading.Thread(target=publish_after_delay, daemon=True)
+        sampler.start()
+        publisher_thread.start()
+
+        msg = p.get_message(timeout=None)
+        stop_sampling.set()
+        sampler.join(timeout=1.0)
+        publisher_thread.join(timeout=1.0)
+
+        assert msg is not None and msg["data"] == b"msg"
+        assert samples, "sampler never observed the in-flight blocking read"
+        assert all(sample == orig_timeout for sample in samples)
+        assert conn.socket_timeout == orig_timeout
+        # The per-read block-forever override must not leak onto the socket:
+        # once the read returns, the socket carries the configured timeout.
+        assert conn._sock.gettimeout() == orig_timeout
+        p.close()
+
+    def test_block_indefinitely_does_not_alter_subsequent_reads(self, request):
+        """
+        After a blocking read returns, a follow-up non-blocking read must
+        still honor the configured ``socket_timeout`` (i.e. the per-read
+        block-forever override does not bleed into later operations and
+        does not require mutating any connection-wide state).
+        """
+        r = self._make_client(
+            request, socket_timeout=self.SOCKET_TIMEOUT, no_retry=True
+        )
+        publisher = self._make_client(request)
+        p = r.pubsub()
+        p.subscribe("foo")
+        wait_for_message(p, timeout=1.0)
+
+        # First a blocking read.
+        publisher.publish("foo", "first")
+        msg = p.get_message(timeout=None)
+        assert msg is not None and msg["data"] == b"first"
+
+        # Then a non-blocking read with a short timeout and no message.
+        # If the block-forever override leaked, this would block past the
+        # timeout.
+        start = time.monotonic()
+        msg = p.get_message(timeout=0.1)
+        elapsed = time.monotonic() - start
+        assert msg is None
+        assert elapsed < 0.5
+        p.close()
+
 
 class TestClusterPubSubTimeoutPropagation:
     """
