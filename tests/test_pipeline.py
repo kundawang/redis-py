@@ -230,6 +230,29 @@ class TestPipeline:
             assert not pipe.watching
 
     @pytest.mark.onlynoncluster
+    def test_pipeline_reset_releases_connection_when_cancelled(self, r):
+        # Sync counterpart of the async regression test for
+        # https://github.com/redis/redis-py/issues/4121: interrupting
+        # reset() while it reads the UNWATCH reply must still return the
+        # pooled connection to the pool.
+        r.set("a", 0)
+
+        pool = r.connection_pool
+        pipe = r.pipeline()
+        pipe.watch("a")
+        assert pipe.connection is not None
+        assert pipe.connection in pool._in_use_connections
+        leased = pipe.connection
+
+        # Interrupt the UNWATCH reply read to cancel reset() mid-call.
+        with mock.patch.object(leased, "read_response", side_effect=KeyboardInterrupt):
+            with pytest.raises(KeyboardInterrupt):
+                pipe.reset()
+
+        assert pipe.connection is None
+        assert leased not in pool._in_use_connections
+
+    @pytest.mark.onlynoncluster
     def test_watch_failure_in_empty_transaction(self, r):
         r["a"] = 1
         r["b"] = 2
